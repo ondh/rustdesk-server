@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,7 +51,7 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<Arc<std::sync::Mutex<Encrypt>>>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -863,7 +863,16 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = if let Some(enc) = enc {
+                            if let Ok(mut enc) = enc.lock() {
+                                enc.enc(&bytes)
+                            } else {
+                                bytes
+                            }
+                        } else {
+                            bytes
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1226,11 +1235,64 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            let mut enc: Option<Arc<std::sync::Mutex<Encrypt>>> = None;
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (mut eph_pk, eph_sk) = box_::gen_keypair();
+                eph_pk.0[31] &= 0x7f;
+                let signed_key = sign::sign(&eph_pk.0, sk);
+                let mut kx_msg = RendezvousMessage::new();
+                let mut kx = KeyExchange::new();
+                kx.keys.push(signed_key.into());
+                kx_msg.set_key_exchange(kx);
+                if let Ok(bytes) = kx_msg.write_to_bytes() {
+                    if framed.send(Bytes::from(bytes)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                if let Ok(Some(Ok(first_bytes))) = timeout(30_000, framed.next()).await {
+                    let mut first_handled = false;
+                    if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&first_bytes) {
+                        if let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union {
+                            if ex.keys.len() == 2 {
+                                if let Ok(shared_key) = Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk) {
+                                    enc = Some(Arc::new(std::sync::Mutex::new(Encrypt::new(shared_key))));
+                                    first_handled = true;
+                                }
+                            }
+                        }
+                    }
+                    let (a, mut b) = framed.split();
+                    sink = Some(Sink::TcpStream(a, enc.clone()));
+                    if !first_handled {
+                        if !self.handle_tcp(&first_bytes, &mut sink, addr, key, ws).await {
+                            return Ok(());
+                        }
+                    }
+                    while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                        if let Some(enc) = enc.as_ref() {
+                            if let Ok(mut enc) = enc.lock() {
+                                if enc.dec(&mut bytes).is_err() {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                            break;
+                        }
+                    }
+                } else {
+                    return Ok(());
+                }
+            } else {
+                let (a, mut b) = framed.split();
+                sink = Some(Sink::TcpStream(a, None));
+                while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        break;
+                    }
                 }
             }
         }
